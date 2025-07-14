@@ -1,4 +1,4 @@
-## [OneShot](https://github.com/drygdryg/OneShot) installer for [Termux](https://termux.com/)
+## [OneShot](https://github.com/siper86/Oneshot_Termux_installer) installer for [Termux](https://termux.com/)
 ### Setup
 ```
 curl -sSf https://raw.githubusercontent.com/drygdryg/OneShot_Termux_installer/master/installer.sh | bash
