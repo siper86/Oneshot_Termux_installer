@@ -360,6 +360,7 @@ class ConnectionStatus:
         self.last_m_message = 0
         self.essid = ''
         self.wpa_psk = ''
+        self.bssid = ''  # Добавляем для хранения BSSID в режиме PBC
 
     def isFirstHalfValid(self):
         return self.last_m_message > 5
@@ -432,13 +433,22 @@ class Companion:
             os.makedirs(self.pixiewps_dir)
 
         self.generator = WPSpin()
+        self.message_counter = collections.defaultdict(int)  # Счетчик для групп сообщений
+        self.message_sequence = collections.deque(maxlen=3)  # Очередь для хранения последних 2-3 сообщений
+        self.last_sequence_hash = None  # Хэш последней последовательности
+        self.max_repeats = 3  # Максимальное количество повторов группы сообщений
 
     def __init_wpa_supplicant(self):
         print('[*] Running wpa_supplicant…')
-        cmd = 'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{} -c{}'.format(self.interface, self.tempconf)
+        # Завершаем существующие процессы wpa_supplicant для избежания конфликтов
+        subprocess.run(f"pkill -f 'wpa_supplicant.*{self.interface}'", shell=True)
+        # Сбрасываем интерфейс
+        subprocess.run(f"ip link set {self.interface} down", shell=True)
+        subprocess.run(f"ip link set {self.interface} up", shell=True)
+        cmd = f'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{self.interface} -c{self.tempconf}'
         self.wpas = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
-        # Waiting for wpa_supplicant control interface initialization
+        # Ожидаем инициализацию интерфейса управления wpa_supplicant
         while True:
             ret = self.wpas.poll()
             if ret is not None and ret != 0:
@@ -478,26 +488,31 @@ class Companion:
         if verbose:
             sys.stderr.write(line + '\n')
 
+        # Определяем сообщение для отслеживания
+        current_message = None
         if line.startswith('WPS: '):
             if 'Building Message M' in line:
                 n = int(line.split('Building Message M')[1].replace('D', ''))
                 self.connection_status.last_m_message = n
-                print('[*] Sending WPS Message M{}…'.format(n))
+                current_message = f'[*] Sending WPS Message M{n}…'
+                print(current_message)
             elif 'Received M' in line:
                 n = int(line.split('Received M')[1])
                 self.connection_status.last_m_message = n
-                print('[*] Received WPS Message M{}'.format(n))
+                current_message = f'[*] Received WPS Message M{n}'
+                print(current_message)
                 if n == 5:
                     print('[+] The first half of the PIN is valid')
             elif 'Received WSC_NACK' in line:
                 self.connection_status.status = 'WSC_NACK'
-                print('[*] Received WSC NACK')
+                current_message = '[*] Received WSC NACK'
+                print(current_message)
                 print('[-] Error: wrong PIN code')
             elif 'Enrollee Nonce' in line and 'hexdump' in line:
                 self.pixie_creds.e_nonce = get_hex(line)
                 assert(len(self.pixie_creds.e_nonce) == 16*2)
                 if pixiemode:
-                    print('[P] E-Nonce: {}'.format(self.pixie_creds.e_nonce))
+                    print('[P35] E-Nonce: {}'.format(self.pixie_creds.e_nonce))
             elif 'DH own Public Key' in line and 'hexdump' in line:
                 self.pixie_creds.pkr = get_hex(line)
                 assert(len(self.pixie_creds.pkr) == 192*2)
@@ -529,41 +544,71 @@ class Companion:
         elif ': State: ' in line:
             if '-> SCANNING' in line:
                 self.connection_status.status = 'scanning'
-                print('[*] Scanning…')
+                current_message = '[*] Scanning…'
+                print(current_message)
         elif ('WPS-FAIL' in line) and (self.connection_status.status != ''):
             self.connection_status.status = 'WPS_FAIL'
-            print('[-] wpa_supplicant returned WPS-FAIL')
-#        elif 'NL80211_CMD_DEL_STATION' in line:
-#            print("[!] Unexpected interference — kill NetworkManager/wpa_supplicant!")
+            current_message = '[-] wpa_supplicant returned WPS-FAIL'
+            print(current_message)
         elif 'Trying to authenticate with' in line:
             self.connection_status.status = 'authenticating'
             if 'SSID' in line:
                 self.connection_status.essid = codecs.decode("'".join(line.split("'")[1:-1]), 'unicode-escape').encode('latin1').decode('utf-8', errors='replace')
-            print('[*] Authenticating…')
+            current_message = '[*] Authenticating…'
+            print(current_message)
         elif 'Authentication response' in line:
-            print('[+] Authenticated')
+            current_message = '[+] Authenticated'
+            print(current_message)
         elif 'Trying to associate with' in line:
             self.connection_status.status = 'associating'
             if 'SSID' in line:
                 self.connection_status.essid = codecs.decode("'".join(line.split("'")[1:-1]), 'unicode-escape').encode('latin1').decode('utf-8', errors='replace')
-            print('[*] Associating with AP…')
+            current_message = '[*] Associating with AP…'
+            print(current_message)
         elif ('Associated with' in line) and (self.interface in line):
             bssid = line.split()[-1].upper()
+            self.connection_status.bssid = bssid
             if self.connection_status.essid:
-                print('[+] Associated with {} (ESSID: {})'.format(bssid, self.connection_status.essid))
+                current_message = f'[+] Associated with {bssid} (ESSID: {self.connection_status.essid})'
             else:
-                print('[+] Associated with {}'.format(bssid))
+                current_message = f'[+] Associated with {bssid}'
+            print(current_message)
         elif 'EAPOL: txStart' in line:
             self.connection_status.status = 'eapol_start'
-            print('[*] Sending EAPOL Start…')
+            current_message = '[*] Sending EAPOL Start…'
+            print(current_message)
         elif 'EAP entering state IDENTITY' in line:
-            print('[*] Received Identity Request')
+            current_message = '[*] Received Identity Request'
+            print(current_message)
         elif 'using real identity' in line:
-            print('[*] Sending Identity Response…')
+            current_message = '[*] Sending Identity Response…'
+            print(current_message)
         elif pbc_mode and ('selected BSS ' in line):
             bssid = line.split('selected BSS ')[-1].split()[0].upper()
             self.connection_status.bssid = bssid
-            print('[*] Selected AP: {}'.format(bssid))
+            current_message = f'[*] Selected AP: {bssid}'
+            print(current_message)
+
+        # Отслеживание повторяющихся групп сообщений (2-3 сообщения)
+        if current_message:
+            self.message_sequence.append(current_message)
+            # Создаем хэш текущей последовательности сообщений
+            sequence_hash = hash(tuple(self.message_sequence))
+            if len(self.message_sequence) >= 2:  # Проверяем, если есть минимум 2 сообщения
+                if sequence_hash == self.last_sequence_hash:
+                    self.message_counter[sequence_hash] += 1
+                    if self.message_counter[sequence_hash] > self.max_repeats:
+                        print(f"[!] Detected {self.message_counter[sequence_hash]} repeated sequences: {list(self.message_sequence)}. Restarting wpa_supplicant...")
+                        self.wpas.terminate()
+                        self.__init_wpa_supplicant()
+                        self.message_counter.clear()
+                        self.message_sequence.clear()
+                        self.last_sequence_hash = None
+                        return False  # Прерываем текущую попытку
+                else:
+                    self.message_counter.clear()
+                    self.message_counter[sequence_hash] = 1
+                    self.last_sequence_hash = sequence_hash
 
         return True
 
@@ -648,6 +693,8 @@ class Companion:
             verbose = self.print_debug
         self.pixie_creds.clear()
         self.connection_status.clear()
+        self.message_counter.clear()  # Очищаем счетчик сообщений перед новой попыткой
+        self.last_message = None
         self.wpas.stdout.read(300)   # Clean the pipe
         if pbc_mode:
             if bssid:
@@ -677,6 +724,7 @@ class Companion:
                 break
 
         self.sendOnly('WPS_CANCEL')
+        time.sleep(1)  # Задержка после отмены
         return False
 
     def single_connection(self, bssid=None, pin=None, pixiemode=False, pbc_mode=False, showpixiecmd=False,
